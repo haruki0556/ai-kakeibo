@@ -4,6 +4,8 @@ import chainlit as cl
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+from kakeibo.db import init_db
+
 
 # .env から環境変数を読み込む
 load_dotenv()
@@ -16,9 +18,15 @@ if not GOOGLE_API_KEY:
 
 # Gemini 2.5 Flash を使う LLM クライアントを作成
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+    model="gemini-2.5-flash-lite",
     api_key=GOOGLE_API_KEY,
 )
+
+
+@cl.on_chat_start
+async def on_chat_start() -> None:
+    # 初回起動時にDBテーブルを作成
+    init_db()
 
 
 @cl.on_message
