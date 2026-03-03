@@ -1,0 +1,5 @@
+chainlit==2.9.6
+langgraph==1.0.10
+langchain-google-genai==4.2.1
+python-dotenv==1.2.2
+sqlmodel==0.0.37

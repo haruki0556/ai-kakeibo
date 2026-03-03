@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from kakeibo.db import init_db
+from kakeibo.services.input_parser import parse_message, UserInput
 
 
 # .env から環境変数を読み込む
@@ -29,12 +30,22 @@ async def on_chat_start() -> None:
     init_db()
 
 
+def _format_receipt_confirmation(user_input: UserInput) -> str:
+    """入力受付の確認文を作る."""
+    parts = []
+    if user_input.has_text:
+        parts.append(f"テキスト（{len(user_input.text)}文字）")
+    if user_input.has_images:
+        parts.append(f"画像{len(user_input.image_paths)}枚")
+    if not parts:
+        return "テキストまたは画像を送信してください。"
+    return "".join(parts) + "を受け取りました。次のステップで分類・記録します。"
+
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
-    """ユーザーからのテキストメッセージに Gemini が返信するだけのシンプルなハンドラ。"""
-    # LangChain の ChatGoogleGenerativeAI は非同期メソッド ainvoke を提供している
-    response = await llm.ainvoke(message.content)
-
-    # response は AIMessage なので .content からテキストを取り出す
-    await cl.Message(content=str(response.content)).send()
+    """テキストまたはレシート画像の入力を受け付ける（Phase1 入力受付）. """
+    user_input = parse_message(message)
+    confirmation = _format_receipt_confirmation(user_input)
+    await cl.Message(content=confirmation).send()
 
