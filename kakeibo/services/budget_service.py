@@ -8,6 +8,9 @@ from typing import Optional
 from sqlmodel import Session, select
 
 from kakeibo.models import BudgetSetting, Expense
+from kakeibo.models import CategoryBudget, ExpenseCategory
+
+from kakeibo.services.expense_service import sum_expenses_by_category_for_month
 
 
 # ----- 2-1: 設定の保存 -----
@@ -118,6 +121,9 @@ def get_budget_status(
 
     setting = get_budget_setting(session, user_id)
     if setting is None:
+        year_month = get_current_year_month(today)
+        category_budgets = get_category_budgets(session, user_id, year_month)
+        category_spent = sum_expenses_by_category_for_month(session, user_id, year_month)
         return {
             "is_set": False,
             "payday_day": 25,
@@ -126,12 +132,18 @@ def get_budget_status(
             "remaining_days": remaining_days_until_payday(today, 25),
             "available_yen": None,
             "next_payday": _next_payday(today, 25),
+            "category_budgets": category_budgets,
+            "category_spent": category_spent,
         }
 
     spent = spent_from_month_start(session, user_id, today)
     remaining = remaining_days_until_payday(today, setting.payday_day)
     target = setting.target_amount_yen
     available = (target - spent) if target > 0 else None
+
+    year_month = get_current_year_month(today)
+    category_budgets = get_category_budgets(session, user_id, year_month)
+    category_spent = sum_expenses_by_category_for_month(session, user_id, year_month)
 
     return {
         "is_set": target > 0,
@@ -141,4 +153,67 @@ def get_budget_status(
         "remaining_days": remaining,
         "available_yen": available,
         "next_payday": _next_payday(today, setting.payday_day),
+        "category_budgets": category_budgets,
+        "category_spent": category_spent,
     }
+
+
+# ----- カテゴリ別予算（予算案反映用） -----
+
+
+def get_current_year_month(today: Optional[date] = None) -> str:
+    """現在の年月を "YYYY-MM" で返す."""
+    d = today or date.today()
+    return d.strftime("%Y-%m")
+
+
+def get_category_budgets(
+    session: Session,
+    user_id: int,
+    year_month: str,
+) -> dict:
+    """指定月のカテゴリ別予算を取得。ExpenseCategory -> amount_yen の辞書."""
+    stmt = select(CategoryBudget).where(
+        CategoryBudget.user_id == user_id,
+        CategoryBudget.year_month == year_month,
+    )
+    rows = list(session.exec(stmt).all())
+    return {r.category: r.amount_yen for r in rows}
+
+
+def save_category_budgets(
+    session: Session,
+    user_id: int,
+    year_month: str,
+    category_amounts: dict,
+) -> None:
+    """予算案を今月のカテゴリ別予算として保存。既存は上書き。キーは ExpenseCategory または str（value）. """
+    for key, amount_yen in category_amounts.items():
+        if isinstance(key, ExpenseCategory):
+            category = key
+        elif isinstance(key, str):
+            try:
+                category = ExpenseCategory(key)
+            except ValueError:
+                continue
+        else:
+            continue
+        existing = session.exec(
+            select(CategoryBudget).where(
+                CategoryBudget.user_id == user_id,
+                CategoryBudget.year_month == year_month,
+                CategoryBudget.category == category,
+            )
+        ).first()
+        if existing:
+            existing.amount_yen = amount_yen
+        else:
+            session.add(
+                CategoryBudget(
+                    user_id=user_id,
+                    year_month=year_month,
+                    category=category,
+                    amount_yen=amount_yen,
+                )
+            )
+    session.commit()

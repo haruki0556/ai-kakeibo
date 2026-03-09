@@ -1,11 +1,41 @@
 """支出の保存とデフォルトユーザー取得（Phase1 抽出・分類）. """
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import TYPE_CHECKING, List
 
 from sqlmodel import Session, select
 
 from kakeibo.models import Expense, User
+from kakeibo.models import ExpenseCategory
+
+
+def sum_expenses_by_category_for_month(
+    session: Session,
+    user_id: int,
+    year_month: str,
+) -> dict:
+    """指定月（YYYY-MM）のカテゴリ別支出合計。ExpenseCategory -> 円."""
+    parts = year_month.split("-")
+    if len(parts) != 2:
+        return {}
+    y, m = int(parts[0]), int(parts[1])
+    start = date(y, m, 1)
+    if m == 12:
+        end = date(y, 12, 31)
+    else:
+        end = date(y, m + 1, 1) - timedelta(days=1)
+    stmt = (
+        select(Expense.category, Expense.amount_yen)
+        .where(Expense.user_id == user_id)
+        .where(Expense.spent_on >= start)
+        .where(Expense.spent_on <= end)
+    )
+    rows = session.exec(stmt).all()
+    result: dict = {}
+    for cat, amt in rows:
+        result[cat] = result.get(cat, 0) + amt
+    return result
 
 
 def get_recent_expenses(session: Session, user_id: int, limit: int = 10) -> List[Expense]:

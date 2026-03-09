@@ -39,6 +39,15 @@ class BudgetSetting(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
 
 
+class CategoryBudget(SQLModel, table=True):
+    """今月のカテゴリ別予算（予算案を反映したもの）. """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    year_month: str = Field(index=True)  # "YYYY-MM"
+    category: ExpenseCategory = Field(index=True)
+    amount_yen: int = Field(ge=0)
+
+
 class Expense(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id", index=True)

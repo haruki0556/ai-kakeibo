@@ -10,7 +10,12 @@ from kakeibo.agent import create_budget_agent_graph
 from kakeibo.agent.graph import run_agent_sync
 from kakeibo.db import init_db, session_scope
 from kakeibo.models import ExpenseCategory
-from kakeibo.services.budget_service import get_budget_status, upsert_budget_setting
+from kakeibo.services.budget_service import (
+    get_budget_status,
+    get_current_year_month,
+    save_category_budgets,
+    upsert_budget_setting,
+)
 from kakeibo.services.expense_extractor import extract_expenses
 from kakeibo.services.expense_service import (
     get_or_create_default_user,
@@ -62,6 +67,9 @@ BUDGET_SET_PREFIX = ("予算設定", "予算設定:", "予算 ")
 # Phase3-2: 購入相談とみなすキーワード（記録・予算以外を振り分け）
 PURCHASE_CONSULT_KEYWORDS = ("買いたい", "買っていい", "買ってもいい", "購入していい", "買っていい？", "いい？", "買う？", "買おうか")
 
+# 予算案作成でエージェントに流すキーワード（グラフ内の route と一致）
+BUDGET_PROPOSAL_KEYWORDS = ("予算案", "予算を作成", "予算を振り分けて", "カテゴリ別予算")
+
 
 def _parse_amount_yen(s: str) -> int:
     """「30万」「300000」などを円で返す."""
@@ -99,7 +107,7 @@ def _parse_budget_command(text: str) -> tuple[int, int] | None:
 
 
 def _format_budget_status(status: dict) -> str:
-    """2-4: 残り日数・使用可能金額の表示ブロック用テキスト."""
+    """2-4: 残り日数・使用可能金額の表示ブロック用テキスト。カテゴリ別予算があれば追加表示."""
     lines = ["**予算の状況**", ""]
     lines.append(f"・今月の支出: {status['spent_yen']:,}円")
     lines.append(f"・次の給与日まで: あと **{status['remaining_days']}日**")
@@ -109,12 +117,24 @@ def _format_budget_status(status: dict) -> str:
     else:
         lines.append("・予算を設定すると「使用可能金額」が表示されます。")
         lines.append("　例: `予算設定 25 300000`（給与日25日、目標30万円）")
+    cat_budgets = status.get("category_budgets") or {}
+    cat_spent = status.get("category_spent") or {}
+    if cat_budgets:
+        lines.append("")
+        lines.append("**カテゴリ別予算の使用状況（今月）**")
+        for cat, amount_yen in sorted(cat_budgets.items(), key=lambda x: x[0].value):
+            label = CATEGORY_LABELS.get(cat, getattr(cat, "value", str(cat)))
+            used = cat_spent.get(cat, 0)
+            remaining = amount_yen - used
+            lines.append(f"・{label}: 予算 {amount_yen:,}円（使用 {used:,}円 / 残り {remaining:,}円）")
     return "\n".join(lines)
 
 
 def _is_budget_status_request(text: str) -> bool:
-    """予算状況の表示要求かどうか."""
+    """予算状況の表示要求かどうか。予算案作成の依頼は含めない."""
     t = (text or "").strip()
+    if any(kw in t for kw in BUDGET_PROPOSAL_KEYWORDS):
+        return False  # 「予算案を作成して」等はエージェントへ
     return any(kw in t for kw in BUDGET_STATUS_KEYWORDS) and "予算設定" not in t
 
 
@@ -124,6 +144,17 @@ def _is_purchase_consult(text: str) -> bool:
     if not t or len(t) > 200:
         return False
     return any(kw in t for kw in PURCHASE_CONSULT_KEYWORDS)
+
+
+def _is_budget_proposal_request(text: str) -> bool:
+    """予算案作成とみなすかどうか."""
+    t = (text or "").strip()
+    return any(kw in t for kw in BUDGET_PROPOSAL_KEYWORDS)
+
+
+def _is_agent_trigger(text: str) -> bool:
+    """購入相談 or 予算案作成のときエージェントグラフを起動する."""
+    return _is_purchase_consult(text) or _is_budget_proposal_request(text)
 
 
 def _is_list_request(text: str) -> bool:
@@ -241,10 +272,24 @@ async def on_setup_budget(action: cl.Action) -> None:
     await action.remove()
 
 
+def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = "") -> None:
+    import json
+    # #region agent log
+    try:
+        with open("/home/haruk/ai-kakeibo/.cursor/debug-d0d0b3.log", "a") as f:
+            f.write(json.dumps({"sessionId": "d0d0b3", "location": location, "message": message, "data": data, "hypothesisId": hypothesis_id, "timestamp": __import__("time").time() * 1000}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     """テキストまたはレシート画像から支出を抽出して保存、または記録一覧を表示（Phase1 Chainlit フロー）. """
     user_input = parse_message(message)
+
+    # #region agent log
+    _debug_log("app.py:on_message", "message received", {"text_preview": (user_input.text or "")[:80], "agent_waiting_resume": cl.user_session.get("agent_waiting_resume"), "agent_thread_id": cl.user_session.get("agent_thread_id")}, "B")
+    # #endregion
 
     if not user_input.has_text and not user_input.has_images:
         await cl.Message(content=_format_receipt_confirmation(user_input)).send()
@@ -286,7 +331,86 @@ async def on_message(message: cl.Message) -> None:
         await cl.Message(content=_format_budget_status(status)).send()
         return
 
+    # エージェント resume: 前回が interrupt で待機中なら次のメッセージで再開
+    if user_input.has_text and not user_input.has_images and cl.user_session.get("agent_waiting_resume") is True:
+        # #region agent log
+        _debug_log("app.py:resume_block", "entering resume", {"thread_id": cl.user_session.get("agent_thread_id")}, "B")
+        # #endregion
+        user_id = await _resolve_user_id()
+        thread_id = cl.user_session.get("agent_thread_id") or f"agent_{user_id}"
+        result, is_interrupted, interrupt_display = await asyncio.to_thread(
+            run_agent_sync,
+            budget_agent_graph,
+            user_id,
+            user_input.text.strip(),
+            thread_id,
+            resume_value=user_input.text.strip(),
+        )
+        if is_interrupted:
+            await cl.Message(content=interrupt_display).send()
+            return
+        cl.user_session.set("agent_waiting_resume", False)
+        cl.user_session.set("agent_thread_id", None)
+        # #region agent log
+        _debug_log("app.py:resume_done", "resume finished not interrupted", {"flow": result.get("flow"), "has_proposal_amounts": bool(result.get("proposal_amounts"))}, "C")
+        # #endregion
+        flow = result.get("flow")
+        if flow == "budget_proposal" and result.get("proposal_amounts"):
+            year_month = await asyncio.to_thread(get_current_year_month)
+            def _save_cat() -> None:
+                with session_scope() as session:
+                    save_category_budgets(session, user_id, year_month, result["proposal_amounts"])
+            await asyncio.to_thread(_save_cat)
+            await cl.Message(content="予算案を今月のカテゴリ別予算として保存しました。\n\n" + (result.get("proposal_text") or "")).send()
+            return
+        await cl.Message(content=result.get("agent_response") or result.get("proposal_text") or "（返答がありません）").send()
+        return
+
+    # エージェント新規: 購入相談 or 予算案作成でグラフ開始
+    if user_input.has_text and not user_input.has_images and _is_agent_trigger(user_input.text):
+        user_id = await _resolve_user_id()
+        import uuid
+        thread_id = f"agent_{user_id}_{uuid.uuid4().hex[:12]}"
+        cl.user_session.set("agent_thread_id", thread_id)
+
+        result, is_interrupted, interrupt_display = await asyncio.to_thread(
+            run_agent_sync,
+            budget_agent_graph,
+            user_id,
+            user_input.text.strip(),
+            thread_id,
+            resume_value=None,
+        )
+
+        if is_interrupted:
+            cl.user_session.set("agent_waiting_resume", True)
+            # #region agent log
+            _debug_log("app.py:after_interrupt", "set agent_waiting_resume=True", {"thread_id": thread_id}, "A")
+            # #endregion
+            await cl.Message(content=interrupt_display).send()
+            return
+
+        cl.user_session.set("agent_waiting_resume", False)
+        cl.user_session.set("agent_thread_id", None)
+
+        flow = result.get("flow")
+        if flow == "budget_proposal" and result.get("proposal_amounts"):
+            year_month = await asyncio.to_thread(get_current_year_month)
+            def _save_cat() -> None:
+                with session_scope() as session:
+                    save_category_budgets(session, user_id, year_month, result["proposal_amounts"])
+            await asyncio.to_thread(_save_cat)
+            await cl.Message(content="予算案を今月のカテゴリ別予算として保存しました。\n\n" + (result.get("proposal_text") or "")).send()
+            return
+
+        reply = result.get("agent_response") or result.get("proposal_text") or "（返答がありません）"
+        await cl.Message(content=reply).send()
+        return
+
     # 抽出（LLM 構造化出力）
+    # #region agent log
+    _debug_log("app.py:expense_path", "taking expense extraction path", {"text_preview": (user_input.text or "")[:80]}, "D")
+    # #endregion
     try:
         items = await extract_expenses(llm, user_input)
     except Exception as e:
@@ -296,6 +420,9 @@ async def on_message(message: cl.Message) -> None:
         return
 
     if not items:
+        # #region agent log
+        _debug_log("app.py:empty_items", "expense items empty -> 支出を読み取れませんでした", {"text_preview": (user_input.text or "")[:80]}, "D")
+        # #endregion
         await cl.Message(content=_format_recorded_reply([])).send()
         return
 
